@@ -1,12 +1,7 @@
 # FZXMCH
 
-**Version:** 1.0.0  
-**Author:** Fayazul  
-**Engine:** Dear PyGui + Pymunk  
-
 Fizix Mech is a physics sandbox that lets you *build, break, and simulate* your own little mechanical sims.  
 It’s designed for students (me), tinkerers (me), and anyone who ever wanted to see what happens when you throw stuff around at 0.9c in a controlled environment (also me).
-
 ---
 
 ## An Overview
