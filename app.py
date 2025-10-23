@@ -1,4 +1,4 @@
-#Fijix Vala
+#FiZiXMeCH
 
 import time
 import math
@@ -100,7 +100,7 @@ class App:
 
         # DearPyGui setup
         dpg.create_context()
-        dpg.create_viewport(title="FIJIXVALA", width=WIN_W, height=WIN_H)
+        dpg.create_viewport(title="FZXMCH", width=WIN_W, height=WIN_H)
         try:
             # Windowed mode with decorations
             dpg.configure_viewport(decorated=True)

@@ -9,7 +9,7 @@ def build_ui(app):
                     no_close=True, no_title_bar=True, no_move=True, no_resize=True, no_scrollbar=True,
                     tag="controls_win"):
         wrap_w = 300
-        dpg.add_text("FIJIXVALA", color=(59, 130, 246, 255), wrap=wrap_w)
+        dpg.add_text("FZXMCH", color=(59, 130, 246, 255), wrap=wrap_w)
 
         with dpg.collapsing_header(label="Overview", default_open=True):
             app.stats = dpg.add_text("Stats...", wrap=wrap_w)
