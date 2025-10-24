@@ -1,15 +1,15 @@
-#Physics Backend
+# Physics backend
 
 import pymunk
 import math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
-# ---------- CONFIG ----------
+# ---------- Config ----------
 CANVAS_W, CANVAS_H = 1000, 850
 MIN_MAGNITUDE = 0.01
 
-# ---------- VECTOR MODEL ----------
+# ---------- Vector model ----------
 @dataclass
 class Vector:
     label: str
@@ -44,12 +44,13 @@ class Vector:
         return dy
 
 
-# ---------- PHYSICS SIMULATION ----------
+# ---------- Physics simulation ----------
 class Physics:
     def __init__(self) -> None:
         self.space = pymunk.Space()
         self.space.gravity = (0, -9.81)
-        self.space.damping = 0.99
+        # Use no global damping for more ideal Newtonian behavior by default
+        self.space.damping = 1.0
         self.space.sleep_time_threshold = 1.2
         self.space.idle_speed_threshold = 0.2
         self.space.iterations = 40
@@ -95,7 +96,7 @@ class Physics:
         except Exception:
             pass
 
-    # ----- Object Creation -----
+    # ----- Object creation -----
     def add_circle(self, r: float = 0.5, pos: Tuple[float, float] = (0, 2.0), m: float = 1.0, friction: float = 0.8, elasticity: float = 0.9):
         I = pymunk.moment_for_circle(m, 0, r)
         b = pymunk.Body(m, I)
@@ -112,6 +113,12 @@ class Physics:
         b = pymunk.Body(m, I)
         b.position = pos
         s = pymunk.Poly.create_box(b, (w, h))
+        # store logical dimensions to allow correct editing after rotation
+        try:
+            setattr(s, 'box_w', float(w))
+            setattr(s, 'box_h', float(h))
+        except Exception:
+            pass
         s.elasticity = float(elasticity)
         s.friction = float(friction)
         self.space.add(b, s)
@@ -184,6 +191,7 @@ class Physics:
         ang_vel = shape.body.angular_velocity
         elast = shape.elasticity
         fric = shape.friction
+        name = getattr(shape, 'name', None)
         try:
             self.space.remove(shape, shape.body)
         except Exception:
@@ -197,6 +205,11 @@ class Physics:
         s = pymunk.Circle(b, radius)
         s.elasticity = elast
         s.friction = fric
+        if name is not None:
+            try:
+                setattr(s, 'name', name)
+            except Exception:
+                pass
         self.space.add(b, s)
         # replace in dynamic list
         for i, sh in enumerate(self.dynamic):
@@ -214,6 +227,7 @@ class Physics:
         ang_vel = shape.body.angular_velocity
         elast = shape.elasticity
         fric = shape.friction
+        name = getattr(shape, 'name', None)
         try:
             self.space.remove(shape, shape.body)
         except Exception:
@@ -225,8 +239,18 @@ class Physics:
         b.angle = ang
         b.angular_velocity = ang_vel
         s = pymunk.Poly.create_box(b, (width, height))
+        try:
+            setattr(s, 'box_w', float(width))
+            setattr(s, 'box_h', float(height))
+        except Exception:
+            pass
         s.elasticity = elast
         s.friction = fric
+        if name is not None:
+            try:
+                setattr(s, 'name', name)
+            except Exception:
+                pass
         self.space.add(b, s)
         for i, sh in enumerate(self.dynamic):
             if sh is shape:
@@ -237,7 +261,8 @@ class Physics:
         return s
 
     def update_surface(self, seg: pymunk.Segment, length: float, angle_deg: float,
-                       static_friction: float, dynamic_friction: float) -> pymunk.Segment:
+                       static_friction: float, dynamic_friction: float,
+                       radius: Optional[float] = None) -> pymunk.Segment:
         static_friction = max(0.0, float(static_friction))
         dynamic_friction = max(0.0, float(dynamic_friction))
         # compute center in world, then new endpoints
@@ -256,7 +281,8 @@ class Physics:
         # Recreate segment shape (endpoints are read-only in pymunk)
         body = seg.body
         elast = seg.elasticity
-        radius = seg.radius 
+        radius = seg.radius if radius is None else max(0.0, float(radius))
+        name = getattr(seg, 'name', None)
         try:
             self.space.remove(seg)
         except Exception:
@@ -276,6 +302,8 @@ class Physics:
         try:
             setattr(s2, 'static_friction', static_friction)
             setattr(s2, 'dynamic_friction', dynamic_friction)
+            if name is not None:
+                setattr(s2, 'name', name)
         except Exception:
             pass
         return s2

@@ -1,10 +1,10 @@
-#Base renderer
+# Base renderer
 
 import math
 import dearpygui.dearpygui as dpg
 import pymunk
 
-# ---------- COLORS ----------
+# ---------- Colors ----------
 C_GRID = (200, 200, 210, 110)
 C_GRID_MINOR = (210, 210, 220, 70)
 C_AXIS = (40, 40, 48, 255)
@@ -185,7 +185,7 @@ class Renderer:
         p0s = self.to_screen(V.x1, V.y1)
         p1s = self.to_screen(V.x2, V.y2)
         dpg.draw_arrow(p1s, p0s, color=color, thickness=3, size=10, parent=self.tag)
-        label = f"{V.label} {V.magnitude:.1f} N @ {V.angle_deg:.0f}°"
+        label = f"{V.label} {V.magnitude:.1f} N @ {V.angle_deg:.0f} deg"
         label_pos = (p1s[0] + 6, p1s[1] - 12)
         dpg.draw_text(label_pos, label, color=color, parent=self.tag, size=14)
 
@@ -196,11 +196,10 @@ class Renderer:
     def ghost_circle(self, center, r):
         dpg.draw_circle(self.to_screen(*center), r * self.zoom, color=C_GHOST, parent=self.tag)
 
-    # --- NEW FUNCTION FOR GHOST LINE ---
+    @staticmethod
     def draw_ghost_line(p1: tuple[float, float], p2: tuple[float, float]):
-        """
-        Draws a temporary, semi-transparent line and deletes the previous one
-        to create a smooth 'ghost line' effect during mouse dragging.
+        """Draw a temporary, semi-transparent line for previews.
+        Note: This uses a global drawlist/tag; not used by core renderer.
         """
         PREVIEW_LINE_TAG = "temp_wall_preview"
         DRAWLIST_TAG = "drawlist"
@@ -220,8 +219,9 @@ class Renderer:
             tag=PREVIEW_LINE_TAG
         )
 
+    @staticmethod
     def clear_ghost_line():
-        """Deletes the ghost line after the final line is drawn."""
+        """Delete the ghost line after the final line is drawn."""
         PREVIEW_LINE_TAG = "temp_wall_preview"
         if dpg.does_item_exist(PREVIEW_LINE_TAG):
             dpg.delete_item(PREVIEW_LINE_TAG)

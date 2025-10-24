@@ -61,7 +61,7 @@ def build_ui(app):
                     dpg.add_text("Snap to grid")
                     dpg.add_checkbox(
                         default_value=getattr(app, "snap", True),
-                        callback=lambda s, a: setattr(app, "snap", a),
+                        callback=lambda s, a: app.on_snap_toggle(a),
                         tag="snap_toggle",
                     )
                 with dpg.table_row():
@@ -192,7 +192,7 @@ def _ui_refresh_local_forces(app):
         dpg.delete_item(panel, children_only=True)
         for i, lf in enumerate(getattr(app.physics, 'local_forces', []), start=1):
             with dpg.group(parent=panel, horizontal=True):
-                dpg.add_text(f"{lf.label}: mag={lf.magnitude:.2f}N, ang={lf.angle_deg:.1f}°, mode={lf.mode}")
+                dpg.add_text(f"{lf.label}: mag={lf.magnitude:.2f} N, ang={lf.angle_deg:.1f} deg, mode={lf.mode}")
                 def _mk_del(idx=i-1):
                     return lambda: _ui_del_local_force(app, idx)
                 dpg.add_button(label="Remove", callback=_mk_del())

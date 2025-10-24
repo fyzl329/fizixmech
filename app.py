@@ -123,6 +123,8 @@ class App:
             if dpg.does_item_exist("gravity_slider"):
                 dpg.set_value("gravity_slider", float(self.physics.space.gravity[1]))
             self._update_tool_panel()
+            # Ensure snapping sub-controls reflect master toggle
+            self._refresh_snap_controls()
         except Exception:
             pass
 
@@ -176,6 +178,49 @@ class App:
             self.snap_step = max(1e-6, v)
         self._save_settings()
 
+    def on_snap_toggle(self, value):
+        try:
+            self.snap = bool(value)
+        except Exception:
+            self.snap = False
+        # Reflect in both UI controls if they exist
+        try:
+            if dpg.does_item_exist("snap_toggle"):
+                dpg.set_value("snap_toggle", bool(self.snap))
+        except Exception:
+            pass
+        # Enable/disable angle/magnitude controls based on master snap
+        try:
+            self._refresh_snap_controls()
+        except Exception:
+            pass
+        self._save_settings()
+
+    def _refresh_snap_controls(self):
+        enabled = bool(getattr(self, 'snap', False))
+        # Angle snap controls
+        if dpg.does_item_exist("angle_snap_toggle"):
+            try:
+                dpg.configure_item("angle_snap_toggle", enabled=enabled)
+            except Exception:
+                pass
+        if dpg.does_item_exist("angle_snap_input"):
+            try:
+                dpg.configure_item("angle_snap_input", enabled=enabled)
+            except Exception:
+                pass
+        # Magnitude snap controls (input may not exist in all builds)
+        if dpg.does_item_exist("mag_snap_toggle"):
+            try:
+                dpg.configure_item("mag_snap_toggle", enabled=enabled)
+            except Exception:
+                pass
+        if dpg.does_item_exist("mag_snap_input"):
+            try:
+                dpg.configure_item("mag_snap_input", enabled=enabled)
+            except Exception:
+                pass
+
     def on_gravity_change(self, value):
         try:
             gv = float(value)
@@ -203,29 +248,37 @@ class App:
             step = 1.0
         return round(wx / step) * step, round(wy / step) * step
 
-    def _snap_angle_mag(self, p0: tuple[float, float], p1: tuple[float, float]):
-        x0, y0 = p0
-        x1, y1 = p1
-        dx, dy = (x1 - x0), (y1 - y0)
-        r = math.hypot(dx, dy)
-        theta = math.atan2(dy, dx) if r > 1e-12 else 0.0
-        # angle snap
-        if getattr(self, 'angle_snap_enabled', False):
-            try:
-                step_deg = float(self.angle_snap_deg)
-            except Exception:
-                step_deg = 15.0
-            step_rad = max(1e-9, math.radians(step_deg))
-            theta = round(theta / step_rad) * step_rad
-        # magnitude snap
-        if getattr(self, 'mag_snap_enabled', False):
-            try:
-                mstep = float(self.mag_snap_step)
-            except Exception:
-                mstep = 0.25
-            mstep = max(1e-9, mstep)
-            r = round(r / mstep) * mstep
-        return (x0 + r * math.cos(theta), y0 + r * math.sin(theta))
+    def _snap_angle_mag(self, p0: tuple[float, float], p1: tuple[float, float], apply_grid_snap=False):
+            """Apply angle and magnitude snapping. 
+            If apply_grid_snap is True, also snap the final endpoint to the grid."""
+            x0, y0 = p0
+            x1, y1 = p1
+            dx, dy = (x1 - x0), (y1 - y0)
+            r = math.hypot(dx, dy)
+            theta = math.atan2(dy, dx) if r > 1e-12 else 0.0
+            # Master snap must be ON to allow any angle/magnitude snapping
+            snap_master = bool(getattr(self, 'snap', False))
+            # angle snap
+            if snap_master and getattr(self, 'angle_snap_enabled', False):
+                try:
+                    step_deg = float(self.angle_snap_deg)
+                except Exception:
+                    step_deg = 15.0
+                step_rad = max(1e-9, math.radians(step_deg))
+                theta = round(theta / step_rad) * step_rad
+            # magnitude snap
+            if snap_master and getattr(self, 'mag_snap_enabled', False):
+                try:
+                    mstep = float(self.mag_snap_step)
+                except Exception:
+                    mstep = 0.25
+                mstep = max(1e-9, mstep)
+                r = round(r / mstep) * mstep
+            result = (x0 + r * math.cos(theta), y0 + r * math.sin(theta))
+            # Apply grid snap to final position if requested
+            if apply_grid_snap and snap_master:
+                result = self._snap_world(*result)
+            return result
 
     def _animate_zoom(self, dt):
         if dt <= 0:
@@ -570,6 +623,9 @@ class App:
                     seg_start = self._snap_world(*seg_start)
                 # apply dir/mag snap
                 seg_end = self._snap_angle_mag(seg_start, end_world)
+                # Master grid snap has precedence: land endpoint on grid
+                if self.snap and not getattr(self, 'angle_snap_enabled', False) and not getattr(self, 'mag_snap_enabled', False):
+                    seg_end = self._snap_world(*seg_end)
                 self._push_undo()
                 s = self.physics.add_surface(
                     seg_start,
@@ -620,6 +676,8 @@ class App:
             except Exception:
                 sx, sy = 0.0, 0.0
             ex, ey = self._snap_angle_mag((sx, sy), (wx, wy))
+            if self.snap and not getattr(self, 'angle_snap_enabled', False) and not getattr(self, 'mag_snap_enabled', False):
+                ex, ey = self._snap_world(ex, ey)
             dx, dy = (ex - sx), (ey - sy)
             if math.hypot(dx, dy) >= MIN_MAGNITUDE:
                 scope = getattr(self, 'force_scope', 'global')
@@ -659,6 +717,8 @@ class App:
                 if body is not None and apply_pt is not None:
                     sx, sy = apply_pt
                     ex, ey = self._snap_angle_mag(apply_pt, (wx, wy))
+                    if self.snap and not getattr(self, 'angle_snap_enabled', False) and not getattr(self, 'mag_snap_enabled', False):
+                        ex, ey = self._snap_world(ex, ey)
                     dx = ex - sx
                     dy = ey - sy
                     if math.hypot(dx, dy) >= MIN_MAGNITUDE:
@@ -753,8 +813,10 @@ class App:
                     # grid snap anchor
                     if self.snap:
                         w0 = self._snap_world(*w0)
-                    # apply angle/magnitude snap on delta
+                    # apply angle/magnitude snap on delta, then grid-snap endpoint if master snap
                     w1 = self._snap_angle_mag(w0, w1)
+                    if self.snap and not getattr(self, 'angle_snap_enabled', False) and not getattr(self, 'mag_snap_enabled', False):
+                        w1 = self._snap_world(*w1)
                     p0 = self.R.to_screen(*w0)
                     p1 = self.R.to_screen(*w1)
                     dpg.draw_line(p0, p1, color=(120, 255, 255, 200), thickness=2, parent=self.R.tag)
@@ -764,6 +826,8 @@ class App:
             try:
                 p0 = self._fling_apply_point
                 p1 = self._snap_angle_mag(p0, self.drag_curr)
+                if self.snap and not getattr(self, 'angle_snap_enabled', False) and not getattr(self, 'mag_snap_enabled', False):
+                    p1 = self._snap_world(*p1)
                 self.R.draw_dotted_world(p0, p1, color=(59,130,246,220), dash=8, gap=6)
                 p1s = self.R.to_screen(*p1)
                 mag = math.dist(p0, p1) * float(self.fling_scale)
@@ -775,6 +839,8 @@ class App:
             try:
                 sx, sy = self.preview_vector.x1, self.preview_vector.y1
                 ex, ey = self._snap_angle_mag((sx, sy), (self.drag_curr[0], self.drag_curr[1]))
+                if self.snap and not getattr(self, 'angle_snap_enabled', False) and not getattr(self, 'mag_snap_enabled', False):
+                    ex, ey = self._snap_world(ex, ey)
                 Vg = Vector(self.preview_vector.label, sx, sy, ex, ey)
             except Exception:
                 Vg = self.preview_vector
@@ -798,6 +864,14 @@ class App:
                 R.draw_shape_label(s)
             except Exception:
                 pass
+        # Watermark / credit in lower-right of canvas
+        try:
+            margin = 10
+            x = max(0, int(self.R.w) - 160 - margin)
+            y = max(0, int(self.R.h) - 18 - margin)
+            dpg.draw_text((x, y), "made by fayazul", color=(180, 180, 190, 200), parent=self.R.tag, size=14)
+        except Exception:
+            pass
         # Draw local forces as small arrows at body COM
         try:
             for lf in getattr(self.physics, 'local_forces', []):
@@ -920,13 +994,13 @@ class App:
             dpg.delete_item(panel, children_only=True)
             dpg.add_text("Select an item to edit its properties.", tag="prop_placeholder", parent=panel)
             return
+        # Always rebuild the panel so callbacks bind to the latest shape instance
+        dpg.delete_item(panel, children_only=True)
         import math as _m
         typ = self.selected_type
         ref = self.selected_ref
         display_name = (ref.label if typ == "vector" else getattr(ref, "name", "")) or typ.title()
         dpg.configure_item(panel, label=f"Properties: {typ.title()}: {display_name}")
-        if dpg.does_item_exist("prop_placeholder"):
-            dpg.delete_item("prop_placeholder")
 
         if typ in ("circle", "box"):
             shape = ref
@@ -980,10 +1054,18 @@ class App:
                                             callback=lambda s,a,u: self._on_sel_box_h(shape, a))
                     if not dpg.does_item_exist("prop_angle"):
                         dpg.add_input_float(label="Rotation (deg)", tag="prop_angle", parent=panel, width=150, callback=on_angle_deg)
-                    bb = getattr(shape, 'bb', None)
-                    if bb is not None:
-                        dpg.set_value("prop_width", float(max(1e-6, bb.right - bb.left)))
-                        dpg.set_value("prop_height", float(max(1e-6, bb.top - bb.bottom)))
+                    # Prefer stored logical dimensions to avoid AABB distortions when rotated
+                    bw = getattr(shape, 'box_w', None)
+                    bh = getattr(shape, 'box_h', None)
+                    if bw is None or bh is None:
+                        bb = getattr(shape, 'bb', None)
+                        if bb is not None:
+                            bw = float(max(1e-6, bb.right - bb.left))
+                            bh = float(max(1e-6, bb.top - bb.bottom))
+                    if bw is not None:
+                        dpg.set_value("prop_width", float(bw))
+                    if bh is not None:
+                        dpg.set_value("prop_height", float(bh))
             except Exception:
                 pass
 
@@ -1022,11 +1104,76 @@ class App:
                 dpg.add_input_float(label="Dynamic Friction", tag="prop_dfr", parent=panel, width=150, callback=on_dfr)
             if not dpg.does_item_exist("prop_selast"):
                 dpg.add_input_float(label="Elasticity", tag="prop_selast", parent=panel, width=150, callback=lambda s,a,u: setattr(seg, 'elasticity', min(1.0, max(0.0, float(a)))) if a is not None else None)
+            # Editable geometry: length, angle, and radius
+            def _surf_current_len_ang(sg):
+                try:
+                    a_w = sg.body.local_to_world(sg.a)
+                    b_w = sg.body.local_to_world(sg.b)
+                    dx = float(b_w.x - a_w.x)
+                    dy = float(b_w.y - a_w.y)
+                    L = math.hypot(dx, dy)
+                    ang = math.degrees(math.atan2(dy, dx))
+                    return L, ang
+                except Exception:
+                    return 0.0, 0.0
+            def on_slen(s,a,u):
+                try:
+                    Lnew = max(0.0, float(a))
+                    Lcur, ang = _surf_current_len_ang(seg)
+                    s2 = self.physics.update_surface(seg, Lnew, ang,
+                        float(getattr(seg, 'static_friction', getattr(seg, 'friction', 0.6))),
+                        float(getattr(seg, 'dynamic_friction', getattr(seg, 'friction', 0.6))),
+                        radius=float(getattr(seg, 'radius', 0.05)))
+                    self.selected_ref = s2
+                    self.hier_dirty = True
+                    self._update_properties_panel()
+                except Exception:
+                    pass
+            def on_sang(s,a,u):
+                try:
+                    ang = float(a)
+                    Lcur, _ = _surf_current_len_ang(seg)
+                    s2 = self.physics.update_surface(seg, Lcur, ang,
+                        float(getattr(seg, 'static_friction', getattr(seg, 'friction', 0.6))),
+                        float(getattr(seg, 'dynamic_friction', getattr(seg, 'friction', 0.6))),
+                        radius=float(getattr(seg, 'radius', 0.05)))
+                    self.selected_ref = s2
+                    self.hier_dirty = True
+                    self._update_properties_panel()
+                except Exception:
+                    pass
+            def on_sradius(s,a,u):
+                try:
+                    r = max(0.0, float(a))
+                    Lcur, ang = _surf_current_len_ang(seg)
+                    s2 = self.physics.update_surface(seg, Lcur, ang,
+                        float(getattr(seg, 'static_friction', getattr(seg, 'friction', 0.6))),
+                        float(getattr(seg, 'dynamic_friction', getattr(seg, 'friction', 0.6))),
+                        radius=r)
+                    self.selected_ref = s2
+                    self.hier_dirty = True
+                    self._update_properties_panel()
+                except Exception:
+                    pass
+            if not dpg.does_item_exist("prop_slen"):
+                dpg.add_input_float(label="Length (m)", tag="prop_slen", parent=panel, width=150, callback=on_slen)
+            if not dpg.does_item_exist("prop_sang"):
+                dpg.add_input_float(label="Angle (deg)", tag="prop_sang", parent=panel, width=150, callback=on_sang)
+            if not dpg.does_item_exist("prop_sradius"):
+                dpg.add_input_float(label="Radius (m)", tag="prop_sradius", parent=panel, width=150, callback=on_sradius)
 
             dpg.set_value("prop_s_name", getattr(seg, "name", ""))
             dpg.set_value("prop_sfr", float(getattr(seg, "static_friction", getattr(seg, "friction", 0.6))))
             dpg.set_value("prop_dfr", float(getattr(seg, "dynamic_friction", getattr(seg, "friction", 0.6))))
             dpg.set_value("prop_selast", float(getattr(seg, "elasticity", 0.3)))
+            # initialize geometry fields from current segment
+            try:
+                Lcur, angcur = _surf_current_len_ang(seg)
+                dpg.set_value("prop_slen", float(Lcur))
+                dpg.set_value("prop_sang", float(angcur))
+                dpg.set_value("prop_sradius", float(getattr(seg, 'radius', 0.05)))
+            except Exception:
+                pass
 
         elif typ == "vector":
             V = ref
@@ -1072,6 +1219,9 @@ class App:
             new_sh = self.physics.update_circle(shape, float(shape.body.mass), r)
             if new_sh is not None:
                 self.selected_ref = new_sh
+                self.hier_dirty = True
+                # Rebuild panel so callbacks bind to the new shape
+                self._update_properties_panel()
         except Exception:
             pass
 
@@ -1082,6 +1232,8 @@ class App:
             new_sh = self.physics.update_box(shape, float(shape.body.mass), w, h)
             if new_sh is not None:
                 self.selected_ref = new_sh
+                self.hier_dirty = True
+                self._update_properties_panel()
         except Exception:
             pass
 
@@ -1092,6 +1244,8 @@ class App:
             new_sh = self.physics.update_box(shape, float(shape.body.mass), w, h)
             if new_sh is not None:
                 self.selected_ref = new_sh
+                self.hier_dirty = True
+                self._update_properties_panel()
         except Exception:
             pass
 
@@ -1386,6 +1540,7 @@ class App:
             with open(self._settings_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.snap_step = float(data.get("snap_step", self.snap_step))
+            self.snap = bool(data.get("snap_enabled", self.snap))
             gy = float(data.get("gravity_y", self.physics.space.gravity[1]))
             self.physics.space.gravity = (0, gy)
             self.body_tool_type = data.get("body_tool_type", self.body_tool_type)
@@ -1409,10 +1564,7 @@ class App:
             self.mag_snap_step = float(data.get("mag_snap_step", self.mag_snap_step))
             # Clamp bounds
             if self.snap_step <= 0.0:
-                self.snap = False
-            else:
-                self.snap = True
-                self.snap_step = max(1e-6, self.snap_step)
+                self.snap_step = 0.0
             self.surface_radius = max(0.0, self.surface_radius)
             self.surface_static_mu = max(0.0, self.surface_static_mu)
             self.surface_dynamic_mu = max(0.0, self.surface_dynamic_mu)
@@ -1424,6 +1576,7 @@ class App:
         try:
             data = {
                 "snap_step": float(self.snap_step),
+                "snap_enabled": bool(self.snap),
                 "gravity_y": float(self.physics.space.gravity[1]),
                 "body_tool_type": self.body_tool_type,
                 "body_default_mass": float(self.body_default_mass),
