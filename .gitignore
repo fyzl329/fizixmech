@@ -1,11 +1,33 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.log
-.DS_Store
-.env
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
 .vscode/
 .idea/
-extras/
+*.swp
+*.swo
+*~
+
+# Project specific
 settings.json
+saves/*.fzxmch
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/

@@ -2,49 +2,16 @@
 
 import pymunk
 import math
-from dataclasses import dataclass
 from typing import List, Tuple, Optional
+from dataclasses import dataclass
 
-# ---------- Config ----------
-CANVAS_W, CANVAS_H = 1000, 850
-MIN_MAGNITUDE = 0.01
+from .models import Vector, Spring, LocalForce
+from .config import CANVAS_WIDTH, CANVAS_HEIGHT, MIN_MAGNITUDE
 
-# ---------- Vector model ----------
-@dataclass
-class Vector:
-    label: str
-    x1: float
-    y1: float
-    x2: float
-    y2: float
-
-    def _dxdy(self) -> Tuple[float, float]:
-        return self.x2 - self.x1, self.y2 - self.y1
-
-    @property
-    def magnitude(self) -> float:
-        dx, dy = self._dxdy()
-        return (dx**2 + dy**2)**0.5
-
-    @property
-    def angle_deg(self) -> float:
-        dx, dy = self._dxdy()
-        if abs(dx) + abs(dy) < 1e-12:
-            return 0.0
-        return math.degrees(math.atan2(dy, dx))
-
-    @property
-    def Fx(self) -> float:
-        dx, _ = self._dxdy()
-        return dx
-
-    @property
-    def Fy(self) -> float:
-        _, dy = self._dxdy()
-        return dy
+# Aliases for backward compatibility
+CANVAS_W, CANVAS_H = CANVAS_WIDTH, CANVAS_HEIGHT
 
 
-# ---------- Physics simulation ----------
 class Physics:
     def __init__(self) -> None:
         self.space = pymunk.Space()
@@ -61,10 +28,14 @@ class Physics:
         self.vectors: List[Vector] = []
         # Local forces: attached to a specific body, applied each substep
         self.local_forces: List["LocalForce"] = []
+        # Springs connecting bodies and/or fixed anchors
+        self.springs: List[Spring] = []
         self.is_running = True
         self.bounds_limit = 1000.0
         self.last_pruned = 0
         self._accum = 0.0
+        # Simulation speed control (time scale)
+        self.time_scale = 1.0  # 1.0 = real-time, 0.5 = slow-mo, 2.0 = fast-forward
 
     # ----- Impulses & helpers -----
     def wake(self, body: pymunk.Body) -> None:
@@ -109,7 +80,7 @@ class Physics:
         return s
 
     def add_box(self, w: float = 1.0, h: float = 1.0, pos: Tuple[float, float] = (0, 2.0), m: float = 1.0, friction: float = 0.8, elasticity: float = 0.9):
-        I = pymunk.moment_for_box(m, (w, h))
+        I = pymunk.moment_for_box(m, ((w, h)))
         b = pymunk.Body(m, I)
         b.position = pos
         s = pymunk.Poly.create_box(b, (w, h))
@@ -232,7 +203,7 @@ class Physics:
             self.space.remove(shape, shape.body)
         except Exception:
             pass
-        I = pymunk.moment_for_box(mass, (width, height))
+        I = pymunk.moment_for_box(mass, ((width, height)))
         b = pymunk.Body(mass, I)
         b.position = pos
         b.velocity = vel
@@ -349,15 +320,78 @@ class Physics:
             self.local_forces = keep
 
     # ----- Simulation -----
+    def apply_springs(self, h: float) -> None:
+        """Apply spring forces for all springs using Hooke's law and damping.
+
+        h is the fixed substep size (not strictly needed for the force law,
+        but kept for potential future tuning).
+        """
+        if not self.springs:
+            return
+        for sp in list(self.springs):
+            try:
+                (ax, ay), (bx, by), a_body, b_body = sp.get_endpoints(self)
+            except Exception:
+                continue
+            dx = bx - ax
+            dy = by - ay
+            dist = math.hypot(dx, dy)
+            if dist <= 1e-6:
+                continue
+            dirx = dx / dist
+            diry = dy / dist
+
+            # Optional extension limiting like a max distance joint
+            max_len = None
+            if getattr(sp, "max_extension_factor", 0.0) and sp.max_extension_factor > 0:
+                max_len = max(sp.rest_length * sp.max_extension_factor, sp.rest_length)
+            eff_dist = dist
+            if max_len is not None and dist > max_len:
+                eff_dist = max_len
+
+            # Hooke's law (compression or extension)
+            rest = max(1e-6, float(sp.rest_length))
+            spring_force = -float(sp.stiffness) * (eff_dist - rest)
+
+            # Relative velocity along the spring axis for damping
+            rel_vx = rel_vy = 0.0
+            if a_body is not None and b_body is not None:
+                rel_vx = b_body.velocity.x - a_body.velocity.x
+                rel_vy = b_body.velocity.y - a_body.velocity.y
+            elif a_body is not None and b_body is None:
+                rel_vx, rel_vy = -a_body.velocity.x, -a_body.velocity.y
+            elif b_body is not None and a_body is None:
+                rel_vx, rel_vy = b_body.velocity.x, b_body.velocity.y
+            damping_force = -float(sp.damping) * (rel_vx * dirx + rel_vy * diry)
+
+            total = spring_force + damping_force
+            fx = total * dirx
+            fy = total * diry
+
+            if a_body is not None:
+                try:
+                    a_body.apply_force_at_world_point((fx, fy), (ax, ay))
+                except Exception:
+                    pass
+            if b_body is not None:
+                try:
+                    b_body.apply_force_at_world_point((-fx, -fy), (bx, by))
+                except Exception:
+                    pass
+
+
     def step(self, dt: float) -> None:
         """Advance the simulation with a bounded fixed timestep accumulator.
 
         - Uses a smaller fixed step (`h`) for smoother integration.
         - Caps the number of substeps to avoid spiral-of-death on slow frames.
         - Discards excessive accumulated time to keep the sim responsive.
+        - Applies time_scale for slow-mo/fast-forward effect.
         """
         if not self.is_running:
             return
+        # Apply time scale (slow-mo / fast-forward)
+        dt = dt * float(self.time_scale)
         # Clamp very large frame jumps to avoid huge catches
         dt = float(max(0.0, min(float(dt), 0.25)))
         self._accum += dt
@@ -367,6 +401,8 @@ class Physics:
         while self._accum >= h and steps < max_steps:
             # Global vectors behave like continuous forces; apply each substep
             self.apply_vectors()
+            # Springs act each substep as constraints/forces
+            self.apply_springs(h)
             self.space.step(h)
             self._accum -= h
             steps += 1
@@ -416,13 +452,3 @@ class Physics:
     def stats(self):
         ke = sum(0.5 * s.body.mass * (s.body.velocity.length ** 2) for s in self.dynamic)
         return len(self.dynamic), len(self.static), ke
-
-
-# ---------- LOCAL FORCE MODEL ----------
-@dataclass
-class LocalForce:
-    label: str
-    body_id: int  # id(body)
-    magnitude: float
-    angle_deg: float  # direction relative to mode
-    mode: str  # 'body' or 'world'

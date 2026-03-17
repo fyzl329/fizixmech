@@ -4,19 +4,31 @@ import math
 import dearpygui.dearpygui as dpg
 import pymunk
 
-# ---------- Colors ----------
-C_GRID = (200, 200, 210, 110)
-C_GRID_MINOR = (210, 210, 220, 70)
-C_AXIS = (40, 40, 48, 255)
-C_CIRC = (59, 130, 246, 255)
-C_BOX = (71, 85, 105, 255)
-C_SURF = (110, 120, 140, 255)
-C_VEL = (239, 68, 68, 255)
-C_FORCE = (59, 130, 246, 255)
-C_GHOST = (180, 180, 180, 220)
-C_HILITE = (250, 204, 21, 220)
-C_BOUNDS = (160, 160, 160, 120)
-C_LABEL = (235, 235, 240, 255)
+from .config import (
+    COLOR_GRID, COLOR_GRID_MINOR, COLOR_AXIS, COLOR_CIRCLE, COLOR_BOX,
+    COLOR_SURFACE, COLOR_VELOCITY, COLOR_FORCE, COLOR_GHOST, COLOR_HIGHLIGHT,
+    COLOR_BOUNDS, COLOR_LABEL, COLOR_SPRING_REST, COLOR_SPRING_STRETCHED,
+    COLOR_SPRING_COMPRESSED, COLOR_ORIGIN, COLOR_SELECTED
+)
+
+# ---------- Colors (aliases for backward compatibility) ----------
+C_GRID = COLOR_GRID
+C_GRID_MINOR = COLOR_GRID_MINOR
+C_AXIS = COLOR_AXIS
+C_CIRC = COLOR_CIRCLE
+C_BOX = COLOR_BOX
+C_SURF = COLOR_SURFACE
+C_VEL = COLOR_VELOCITY
+C_FORCE = COLOR_FORCE
+C_GHOST = COLOR_GHOST
+C_HILITE = COLOR_HIGHLIGHT
+C_BOUNDS = COLOR_BOUNDS
+C_LABEL = COLOR_LABEL
+C_SPRING_REST = COLOR_SPRING_REST
+C_SPRING_STRETCHED = COLOR_SPRING_STRETCHED
+C_SPRING_COMPRESSED = COLOR_SPRING_COMPRESSED
+C_ORIGIN = COLOR_ORIGIN
+C_SELECTED = COLOR_SELECTED
 
 
 class Renderer:
@@ -106,9 +118,12 @@ class Renderer:
         dpg.draw_line((0, ay), (self.w, ay), color=C_AXIS, thickness=2, parent=self.tag)
         dpg.draw_line((ax, 0), (ax, self.h), color=C_AXIS, thickness=2, parent=self.tag)
 
+        # Origin point (highlighted)
+        dpg.draw_circle((ax, ay), 4, color=C_ORIGIN, fill=C_ORIGIN, parent=self.tag)
+
         # Origin label
         ox, oy = self.to_screen(0, 0)
-        dpg.draw_text((int(ox) + 6, int(oy) - 18), "0, 0", color=C_LABEL, parent=self.tag, size=14)
+        dpg.draw_text((int(ox) + 8, int(oy) - 20), "(0, 0)", color=C_ORIGIN, parent=self.tag, size=13)
 
         # Labels at major ticks in meters
         step_px = major * px_per_world
@@ -228,20 +243,24 @@ class Renderer:
 
     # ---------- Highlights ----------
     def highlight_shape(self, s):
+        """Draw selection highlight with professional style."""
         import pymunk
         if isinstance(s, pymunk.Circle):
             p = self.to_screen(s.body.position.x, s.body.position.y)
-            dpg.draw_circle(p, s.radius * self.zoom, color=C_HILITE, thickness=3, parent=self.tag)
+            # Outer glow
+            dpg.draw_circle(p, s.radius * self.zoom + 2, color=C_SELECTED, thickness=2, parent=self.tag)
+            # Inner highlight
+            dpg.draw_circle(p, s.radius * self.zoom, color=C_HILITE, thickness=1, parent=self.tag)
         elif isinstance(s, pymunk.Poly):
             vs = [self.to_screen(*s.body.local_to_world(v)) for v in s.get_vertices()]
-            dpg.draw_polygon(vs, color=C_HILITE, thickness=3, parent=self.tag)
+            dpg.draw_polygon(vs, color=C_SELECTED, thickness=3, parent=self.tag)
         elif isinstance(s, pymunk.Segment):
             a_world = s.body.local_to_world(s.a)
             b_world = s.body.local_to_world(s.b)
             a = self.to_screen(*a_world)
             b = self.to_screen(*b_world)
-            t = max(2, int(s.radius * 2 * self.zoom) + 2)
-            dpg.draw_line(a, b, color=C_HILITE, thickness=t, parent=self.tag)
+            t = max(3, int(s.radius * 2 * self.zoom) + 3)
+            dpg.draw_line(a, b, color=C_SELECTED, thickness=t, parent=self.tag)
 
     def draw_shape_label(self, s):
         import pymunk
@@ -368,6 +387,77 @@ class Renderer:
             ey = y0 + uy * t_end
             dpg.draw_line((sx, sy), (ex, ey), color=color, parent=self.tag)
             t += dash + gap
+
+
+    def draw_spring(self, spring, physics):
+        """Draw a spring as a squiggly line with color based on stretch/compression."""
+        a, b = spring.get_bodies(physics)
+
+        if a:
+            p0 = (a.position.x, a.position.y)
+        else:
+            p0 = spring.anchor_a
+
+        if b:
+            p1 = (b.position.x, b.position.y)
+        else:
+            p1 = spring.anchor_b
+
+        if p0 is None or p1 is None:
+            return
+
+        # Calculate stretch/compression for color
+        dx = p1[0] - p0[0]
+        dy = p1[1] - p0[1]
+        dist = math.hypot(dx, dy)
+        if dist <= 1e-6:
+            return
+        
+        try:
+            rest = float(getattr(spring, "rest_length", dist))
+        except Exception:
+            rest = dist
+        rest = max(1e-6, rest)
+        ratio = dist / rest
+        if ratio > 1.05:
+            color = C_SPRING_STRETCHED
+        elif ratio < 0.95:
+            color = C_SPRING_COMPRESSED
+        else:
+            color = C_SPRING_REST
+
+        # Convert to screen
+        s0 = self.to_screen(*p0)
+        s1 = self.to_screen(*p1)
+
+        # Generate squiggle points
+        x0, y0 = s0
+        x1, y1 = s1
+        dx_s = x1 - x0
+        dy_s = y1 - y0
+        length = math.hypot(dx_s, dy_s)
+        steps = max(6, int(length / 20))
+
+        points = []
+        for i in range(steps + 1):
+            t = i / steps
+            px = x0 + dx_s * t
+            py = y0 + dy_s * t
+
+            # sinusoidal offset
+            offset = math.sin(t * math.pi * 10) * 6
+            if length > 1e-6:
+                ox = -dy_s / length * offset
+                oy = dx_s / length * offset
+            else:
+                ox, oy = 0, 0
+
+            points.append((px + ox, py + oy))
+
+        # Draw polyline squiggle
+        for i in range(len(points) - 1):
+            dpg.draw_line(points[i], points[i+1], color=color, thickness=2, parent=self.tag)
+
 
     def draw_dotted_world(self, p0, p1, color=(59, 130, 246, 180), dash=6, gap=6):
         p0s = self.to_screen(*p0)

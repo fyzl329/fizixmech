@@ -6,31 +6,33 @@ import dearpygui.dearpygui as dpg
 import json
 import os
 
-from physics import Physics, Vector
-from renderer import Renderer
-from ui import build_ui, build_forces_panel
+from .physics import Physics
+from .models import Vector, Spring, LocalForce
+from .renderer import Renderer
+from .ui import build_ui, build_forces_panel
+from .welcome import HelpPanel, WelcomeOverlay
+from .command_palette import CommandPalette
+from .presets import ALL_PRESETS, get_preset_by_name
 
-# ---------- CONFIG ----------
-WIN_W, WIN_H = 1400, 900
-CANVAS_W, CANVAS_H = 1000, 850
-PANEL_W = 360
-ZOOM_FACTOR = 0.5
-ZOOM_MIN, ZOOM_MAX = 20.0, 400.0
-DEFAULT_ZOOM = 80.0
-CLICK_THRESHOLD = 20
-MIN_MAGNITUDE = 0.01
-ZOOM_HALFLIFE = 0.12
+# Import config from parent
+from .config import (
+    WIN_WIDTH, WIN_HEIGHT, CANVAS_WIDTH, CANVAS_HEIGHT, PANEL_WIDTH,
+    ZOOM_FACTOR, ZOOM_MIN, ZOOM_MAX, DEFAULT_ZOOM, CLICK_THRESHOLD,
+    MIN_MAGNITUDE, ZOOM_HALFLIFE
+)
 
 
 class App:
     def __init__(self) -> None:
         try:
             dpg.destroy_context()
-        except Exception:
-            pass
+        except Exception as e:
+            # Log but continue - context may not exist on first run
+            from .logger import log_debug
+            log_debug(f"No existing Dear PyGui context to destroy: {e}")
 
         self.physics = Physics()
-        self.R: Renderer = None
+        self.R: Renderer
 
         # Interaction / state
         self.mode = "select"
@@ -71,6 +73,28 @@ class App:
 
         # UI references
         self.stats = None
+        self.run_status = None
+        self.workspace_mode = "build"
+        self.grid_visible = True
+        self.build_mode_btn = None
+        self.sim_mode_btn = None
+        self.play_pause_btn = None
+        self.add_menu_btn = None
+        self.grid_toggle_btn = None
+        self.snap_toggle_btn = None
+        self.workspace_badge = None
+        self.mode_hint = None
+        self.viewport_subtitle = None
+        self.footer_workspace = None
+        self.footer_tool = None
+        self.footer_hint = None
+        self.context_menu_visible = False
+        self.context_menu_world = (0.0, 0.0)
+        self.pending_add = None
+        self.show_welcome_on_startup = True
+        self.help_panel = None
+        self.welcome_overlay = None
+        self.command_palette = None
 
         # Panning
         self.is_panning = False
@@ -98,9 +122,17 @@ class App:
         self.surface_dynamic_mu = 0.6
         self.surface_elasticity = 0.3
 
+        # Spring tool state/defaults
+        self.spring_start_body = None
+        self.spring_anchor = None
+        self.spring_preview_tag = None
+        self.spring_default_k = 25.0
+        self.spring_default_damping = 0.6
+        self.spring_max_extension_factor = 2.0
+
         # DearPyGui setup
         dpg.create_context()
-        dpg.create_viewport(title="FZXMCH", width=WIN_W, height=WIN_H)
+        dpg.create_viewport(title="FZXMCH", width=WIN_WIDTH, height=WIN_HEIGHT)
         try:
             # Windowed mode with decorations
             dpg.configure_viewport(decorated=True)
@@ -108,8 +140,12 @@ class App:
             pass
 
         build_ui(self)
-        self.R = Renderer("main_canvas", CANVAS_W, CANVAS_H)
+        self.help_panel = HelpPanel(self)
+        self.welcome_overlay = WelcomeOverlay(self)
+        self.command_palette = CommandPalette(self)
+        self.R = Renderer("main_canvas", CANVAS_WIDTH, CANVAS_HEIGHT)
         self.R.zoom = DEFAULT_ZOOM
+        self.physics.is_running = False
 
         # Load persisted settings
         self._load_settings()
@@ -125,12 +161,13 @@ class App:
             self._update_tool_panel()
             # Ensure snapping sub-controls reflect master toggle
             self._refresh_snap_controls()
+            self._refresh_workspace_ui()
         except Exception:
             pass
 
         # Smooth zoom state
         self.zoom_target = DEFAULT_ZOOM
-        self.zoom_focus_local = (CANVAS_W * 0.5, CANVAS_H * 0.5)
+        self.zoom_focus_local = (CANVAS_WIDTH * 0.5, CANVAS_HEIGHT * 0.5)
         self.zoom_focus_world = (0.0, 0.0)
         self.zoom_focus_ttl = 0.0
         self.zoom_focus_active = False
@@ -138,6 +175,8 @@ class App:
         self._last = time.time()
         dpg.setup_dearpygui()
         dpg.show_viewport()
+        if self.show_welcome_on_startup and self.welcome_overlay is not None:
+            self.welcome_overlay.show()
 
         # History (undo/redo) and initial snapshot
         self._undo_stack = []
@@ -165,6 +204,455 @@ class App:
         self.zoom_focus_ttl = 0.4
         self.zoom_focus_active = True
 
+    def _build_only_modes(self) -> set[str]:
+        return {"body", "surface", "spring"}
+
+    def _sim_preferred_modes(self) -> set[str]:
+        return {"fling"}
+
+    def select_tool(self, mode: str, body_tool_type: str | None = None):
+        if body_tool_type in {"box", "circle"}:
+            self.body_tool_type = body_tool_type
+        self.on_mode_change(mode)
+
+    def set_workspace_mode(self, mode: str):
+        mode = (mode or "build").lower()
+        if mode not in {"build", "sim"}:
+            mode = "build"
+        self.workspace_mode = mode
+        if mode == "build":
+            self.physics.is_running = False
+            if self.mode in self._sim_preferred_modes():
+                self.mode = "select"
+        else:
+            if self.mode in self._build_only_modes():
+                self.mode = "select"
+            self.physics.is_running = True
+        self._clear_surface_preview()
+        self._refresh_workspace_ui()
+        try:
+            self._update_tool_panel()
+            self._update_properties_panel()
+        except Exception:
+            pass
+
+    def set_simulation_running(self, running: bool):
+        if running:
+            self.workspace_mode = "sim"
+        self.physics.is_running = bool(running)
+        self._refresh_workspace_ui()
+
+    def toggle_simulation(self):
+        if self.workspace_mode == "build":
+            self.set_workspace_mode("sim")
+            return
+        self.set_simulation_running(not self.physics.is_running)
+
+    def toggle_grid(self, value: bool | None = None):
+        if value is None:
+            self.grid_visible = not self.grid_visible
+        else:
+            self.grid_visible = bool(value)
+        self._refresh_workspace_ui()
+
+    def show_help(self):
+        if self.help_panel is not None:
+            self.help_panel.show()
+
+    def hide_help(self):
+        if self.help_panel is not None:
+            self.help_panel.hide()
+
+    def show_command_palette(self):
+        if self.command_palette is not None:
+            self.command_palette.show()
+
+    def show_settings(self):
+        if not dpg.does_item_exist("settings_win"):
+            self._create_settings_window()
+        dpg.set_value("settings_show_welcome", bool(self.show_welcome_on_startup))
+        dpg.configure_item("settings_win", show=True)
+
+    def hide_settings(self):
+        if dpg.does_item_exist("settings_win"):
+            dpg.configure_item("settings_win", show=False)
+
+    def _create_settings_window(self):
+        with dpg.window(
+            label="Workspace Settings",
+            modal=True,
+            no_resize=True,
+            no_collapse=True,
+            no_move=False,
+            width=420,
+            height=300,
+            tag="settings_win",
+            show=False,
+        ):
+            dpg.add_text("Workspace Defaults", color=(59, 130, 246, 255))
+            dpg.add_separator()
+            dpg.add_checkbox(
+                label="Show onboarding at startup",
+                tag="settings_show_welcome",
+                default_value=bool(self.show_welcome_on_startup),
+                callback=lambda s, a: self._set_show_welcome(a),
+            )
+            dpg.add_checkbox(
+                label="Show grid",
+                default_value=bool(self.grid_visible),
+                callback=lambda s, a: self.toggle_grid(a),
+            )
+            dpg.add_checkbox(
+                label="Enable grid snap",
+                default_value=bool(self.snap),
+                callback=lambda s, a: self.on_snap_toggle(a),
+            )
+            dpg.add_spacer(height=8)
+            dpg.add_text("Gravity", color=(180, 180, 180, 255))
+            dpg.add_slider_float(
+                default_value=float(self.physics.space.gravity[1]),
+                min_value=-20.0,
+                max_value=20.0,
+                width=220,
+                format="%.2f",
+                clamped=True,
+                callback=lambda s, a: self.on_gravity_change(a),
+            )
+            dpg.add_spacer(height=12)
+            with dpg.group(horizontal=True):
+                dpg.add_button(label="Open Help", width=100, callback=lambda: self.show_help())
+                dpg.add_button(label="Open Palette", width=110, callback=lambda: self.show_command_palette())
+                dpg.add_button(label="Close", width=90, callback=lambda: self.hide_settings())
+
+    def _set_show_welcome(self, value: bool):
+        self.show_welcome_on_startup = bool(value)
+        self._save_settings()
+
+    def _tool_key(self) -> str:
+        if self.mode == "body":
+            return "body_circle" if self.body_tool_type == "circle" else "body_box"
+        return self.mode
+
+    def _tool_hint(self) -> str:
+        hints = {
+            "select": "Inspect, rename, and tune existing parts.",
+            "body_box": "Place rigid rectangular stock into the scene.",
+            "body_circle": "Drop rollers, wheels, and bearings.",
+            "surface": "Sketch rails, floors, and guides.",
+            "force": "Author persistent forces and actuators.",
+            "spring": "Lay down constraints and compliant links.",
+            "fling": "Test motion with impulses and quick abuse.",
+        }
+        return hints.get(self._tool_key(), "Adjust the machine.")
+
+    def clear_selection(self):
+        self.selected_type = None
+        self.selected_ref = None
+        self._update_properties_panel()
+
+    def _shift_down(self) -> bool:
+        for attr in ("mvKey_Shift", "mvKey_LShift", "mvKey_RShift"):
+            code = getattr(dpg, attr, None)
+            try:
+                if code is not None and dpg.is_key_down(code):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _current_world_anchor(self) -> tuple[float, float]:
+        try:
+            if dpg.does_item_exist("main_canvas") and dpg.is_item_hovered("main_canvas"):
+                local_x, local_y = self._local_mouse()
+                wx, wy = self.R.to_world(local_x, local_y)
+            else:
+                wx, wy = self.R.to_world(self.R.w * 0.5, self.R.h * 0.5)
+        except Exception:
+            wx, wy = 0.0, 0.0
+        if self.snap:
+            wx, wy = self._snap_world(wx, wy)
+        return float(wx), float(wy)
+
+    def _select_at_world(self, wx: float, wy: float) -> bool:
+        try:
+            import pymunk
+            p = pymunk.Vec2d(wx, wy)
+        except Exception:
+            return False
+        body = self.physics.pick_body(p)
+        if body is not None:
+            shape = None
+            for sh in self.physics.dynamic:
+                if sh.body is body:
+                    shape = sh
+                    break
+            if shape is not None:
+                if hasattr(shape, "radius"):
+                    self.selected_type, self.selected_ref = "circle", shape
+                elif isinstance(shape, pymunk.Poly):
+                    self.selected_type, self.selected_ref = "box", shape
+                else:
+                    self.selected_type, self.selected_ref = "body", shape
+                self._update_properties_panel()
+                return True
+        seg = self.physics.pick_surface(p)
+        if seg is not None:
+            self.selected_type, self.selected_ref = "surface", seg
+            self._update_properties_panel()
+            return True
+        V = self.physics.pick_vector(p)
+        if V is not None:
+            self.selected_type, self.selected_ref = "vector", V
+            self._update_properties_panel()
+            return True
+        return False
+
+    def hide_context_menu(self):
+        self.context_menu_visible = False
+        if dpg.does_item_exist("canvas_context_menu"):
+            dpg.configure_item("canvas_context_menu", show=False)
+
+    def hide_add_menu(self):
+        if dpg.does_item_exist("add_menu_win"):
+            dpg.configure_item("add_menu_win", show=False)
+
+    def _add_catalog(self):
+        items = [
+            {"id": "body_box", "label": "Box", "category": "Primitives", "keywords": "box cube rectangle body primitive"},
+            {"id": "body_circle", "label": "Circle", "category": "Primitives", "keywords": "circle wheel disk body primitive"},
+            {"id": "surface", "label": "Surface", "category": "Construction", "keywords": "surface wall floor ramp platform line"},
+            {"id": "spring", "label": "Spring", "category": "Constraints", "keywords": "spring constraint connector"},
+            {"id": "force", "label": "Force", "category": "Forces", "keywords": "force vector thrust"},
+            {"id": "fling", "label": "Fling", "category": "Forces", "keywords": "fling impulse throw"},
+        ]
+        for preset in ALL_PRESETS:
+            items.append(
+                {
+                    "id": f"preset:{preset.name}",
+                    "label": preset.name,
+                    "category": f"Presets / {preset.category.title()}",
+                    "keywords": f"{preset.name.lower()} {preset.description.lower()} {preset.category.lower()} preset template",
+                }
+            )
+        return items
+
+    def _refresh_add_menu(self, query: str = ""):
+        panel = "add_menu_results"
+        if not dpg.does_item_exist(panel):
+            return
+        dpg.delete_item(panel, children_only=True)
+        q = (query or "").strip().lower()
+        items = self._add_catalog()
+        if q:
+            filtered = [item for item in items if q in item["label"].lower() or q in item["keywords"]]
+            for item in filtered:
+                dpg.add_button(
+                    label=f"{item['label']}  [{item['category']}]",
+                    width=-1,
+                    parent=panel,
+                    user_data=item["id"],
+                    callback=self._on_add_menu_pick,
+                )
+            if not filtered:
+                dpg.add_text("No matches. Try fewer words.", parent=panel)
+            return
+        grouped = {}
+        for item in items:
+            grouped.setdefault(item["category"], []).append(item)
+        for category, entries in grouped.items():
+            with dpg.tree_node(label=category, default_open=True, parent=panel):
+                for item in entries:
+                    dpg.add_button(
+                        label=item["label"],
+                        width=-1,
+                        user_data=item["id"],
+                        callback=self._on_add_menu_pick,
+                    )
+
+    def show_add_menu(self):
+        self.context_menu_world = self._current_world_anchor()
+        self.hide_context_menu()
+        if not dpg.does_item_exist("add_menu_win"):
+            return
+        wx, wy = self.context_menu_world
+        if dpg.does_item_exist("add_menu_anchor"):
+            dpg.set_value("add_menu_anchor", f"Next placement: ({wx:.2f}, {wy:.2f})")
+        if dpg.does_item_exist("add_menu_search"):
+            dpg.set_value("add_menu_search", "")
+        self._refresh_add_menu("")
+        mx, my = dpg.get_mouse_pos(local=False)
+        dpg.configure_item("add_menu_win", pos=(int(mx), int(my)), show=True)
+        try:
+            dpg.focus_item("add_menu_search")
+        except Exception:
+            pass
+
+    def _on_add_menu_pick(self, sender, app_data, user_data):
+        self.arm_add_item(user_data)
+
+    def arm_add_item(self, item_id: str | None):
+        if not item_id:
+            return
+        self.pending_add = item_id
+        self.hide_add_menu()
+        if item_id == "body_box":
+            self.set_workspace_mode("build")
+            self.select_tool("body", "box")
+        elif item_id == "body_circle":
+            self.set_workspace_mode("build")
+            self.select_tool("body", "circle")
+        elif item_id in {"surface", "spring", "force"}:
+            self.set_workspace_mode("build")
+            self.select_tool(item_id)
+        elif item_id == "fling":
+            self.set_workspace_mode("sim")
+            self.select_tool("fling")
+        elif item_id.startswith("preset:"):
+            self.set_workspace_mode("build")
+            self.select_tool("select")
+        self._refresh_workspace_ui()
+
+    def _finish_pending_add(self):
+        if self.pending_add is None:
+            return
+        self.pending_add = None
+        self.select_tool("select")
+        self._refresh_workspace_ui()
+
+    def _apply_preset_at(self, preset_name: str, anchor: tuple[float, float]):
+        preset = get_preset_by_name(preset_name)
+        if preset is None:
+            return
+        if not preset.objects:
+            return
+        min_x = min(obj.position[0] for obj in preset.objects)
+        min_y = min(obj.position[1] for obj in preset.objects)
+        dx = anchor[0] - min_x
+        dy = anchor[1] - min_y
+        self._push_undo()
+        for obj in preset.objects:
+            pos = (obj.position[0] + dx, obj.position[1] + dy)
+            if obj.type == "circle":
+                shape = self.physics.add_circle(
+                    r=obj.params.get("r", 0.5),
+                    pos=pos,
+                    m=obj.params.get("m", 1.0),
+                    elasticity=obj.params.get("elasticity", 0.9),
+                )
+                self.selected_type, self.selected_ref = "circle", shape
+            elif obj.type == "box":
+                shape = self.physics.add_box(
+                    w=obj.params.get("w", 1.0),
+                    h=obj.params.get("h", 1.0),
+                    pos=pos,
+                    m=obj.params.get("m", 1.0),
+                    elasticity=obj.params.get("elasticity", 0.9),
+                )
+                self.selected_type, self.selected_ref = "box", shape
+            elif obj.type == "surface":
+                length = obj.params.get("length", 4.0)
+                angle = math.radians(obj.params.get("angle", 0.0))
+                half = length * 0.5
+                p1 = (pos[0] - math.cos(angle) * half, pos[1] - math.sin(angle) * half)
+                p2 = (pos[0] + math.cos(angle) * half, pos[1] + math.sin(angle) * half)
+                shape = self.physics.add_surface(p1, p2)
+                self.selected_type, self.selected_ref = "surface", shape
+        self.hier_dirty = True
+        self._update_properties_panel()
+
+    def show_context_menu(self):
+        items = "canvas_context_menu_items"
+        menu = "canvas_context_menu"
+        if not dpg.does_item_exist(items) or not dpg.does_item_exist(menu):
+            return
+        dpg.delete_item(items, children_only=True)
+        self.context_menu_world = self._current_world_anchor()
+        selected_name = None
+        if self.selected_ref is not None and self.selected_type is not None:
+            if self.selected_type == "vector":
+                selected_name = getattr(self.selected_ref, "label", "") or "Force"
+            else:
+                selected_name = getattr(self.selected_ref, "name", "") or self.selected_type.title()
+        if selected_name:
+            dpg.add_text(f"Selected: {selected_name}", parent=items)
+            dpg.add_separator(parent=items)
+            dpg.add_button(label="Delete Selected", width=-1, parent=items, callback=lambda: self._ctx_delete_selected())
+            dpg.add_button(label="Clear Selection", width=-1, parent=items, callback=lambda: self._ctx_clear_selection())
+            dpg.add_separator(parent=items)
+        elif self.workspace_mode == "build":
+            dpg.add_button(label="Add...", width=-1, parent=items, callback=lambda: self._ctx_action(self.show_add_menu))
+            dpg.add_separator(parent=items)
+        dpg.add_button(label="Undo", width=-1, parent=items, callback=lambda: self._ctx_action(self.undo))
+        dpg.add_button(label="Redo", width=-1, parent=items, callback=lambda: self._ctx_action(self.redo))
+        dpg.add_separator(parent=items)
+        dpg.add_button(label="Restore Startup Scene", width=-1, parent=items, callback=lambda: self._ctx_action(self.restore_startup_scene))
+        dpg.add_button(label="Go To Origin", width=-1, parent=items, callback=lambda: self._ctx_action(self.go_to_origin))
+        dpg.add_button(label=f"{'Hide' if self.grid_visible else 'Show'} Grid", width=-1, parent=items, callback=lambda: self._ctx_action(self.toggle_grid))
+        dpg.add_button(label=f"{'Disable' if self.snap else 'Enable'} Snap", width=-1, parent=items, callback=lambda: self._ctx_toggle_snap())
+        dpg.add_separator(parent=items)
+        dpg.add_button(label="Build Workspace", width=-1, parent=items, callback=lambda: self._ctx_set_workspace("build"))
+        dpg.add_button(label="Sim Workspace", width=-1, parent=items, callback=lambda: self._ctx_set_workspace("sim"))
+        dpg.add_button(label="Help", width=-1, parent=items, callback=lambda: self._ctx_action(self.show_help))
+        mx, my = dpg.get_mouse_pos(local=False)
+        dpg.configure_item(menu, pos=(int(mx), int(my)), show=True, height=10)
+        self.context_menu_visible = True
+
+    def _ctx_action(self, fn):
+        self.hide_context_menu()
+        fn()
+
+    def _ctx_toggle_snap(self):
+        self.hide_context_menu()
+        self.on_snap_toggle(not self.snap)
+
+    def _ctx_set_workspace(self, mode: str):
+        self.hide_context_menu()
+        self.set_workspace_mode(mode)
+
+    def _ctx_delete_selected(self):
+        self.hide_context_menu()
+        self.delete_selected()
+
+    def _ctx_clear_selection(self):
+        self.hide_context_menu()
+        self.clear_selection()
+
+    def _refresh_workspace_ui(self):
+        build_active = self.workspace_mode == "build"
+        if self.build_mode_btn and dpg.does_item_exist(self.build_mode_btn):
+            dpg.bind_item_theme(self.build_mode_btn, "mode_build_active_theme" if build_active else "mode_build_idle_theme")
+        if self.sim_mode_btn and dpg.does_item_exist(self.sim_mode_btn):
+            dpg.bind_item_theme(self.sim_mode_btn, "mode_sim_idle_theme" if build_active else "mode_sim_active_theme")
+        if self.play_pause_btn and dpg.does_item_exist(self.play_pause_btn):
+            dpg.set_item_label(self.play_pause_btn, "Run" if not self.physics.is_running else "Pause")
+            dpg.bind_item_theme(self.play_pause_btn, "success_button_theme" if not self.physics.is_running else "danger_button_theme")
+        if self.add_menu_btn and dpg.does_item_exist(self.add_menu_btn):
+            dpg.bind_item_theme(self.add_menu_btn, "tool_active_theme" if self.workspace_mode == "build" else "tool_idle_theme")
+        if self.grid_toggle_btn and dpg.does_item_exist(self.grid_toggle_btn):
+            dpg.set_item_label(self.grid_toggle_btn, "Grid On" if self.grid_visible else "Grid Off")
+            dpg.bind_item_theme(self.grid_toggle_btn, "tool_active_theme" if self.grid_visible else "tool_idle_theme")
+        if self.snap_toggle_btn and dpg.does_item_exist(self.snap_toggle_btn):
+            dpg.set_item_label(self.snap_toggle_btn, "Snap On" if self.snap else "Snap Off")
+            dpg.bind_item_theme(self.snap_toggle_btn, "tool_active_theme" if self.snap else "tool_idle_theme")
+        if self.workspace_badge and dpg.does_item_exist(self.workspace_badge):
+            dpg.set_value(self.workspace_badge, "BUILD WORKSPACE" if build_active else "SIM WORKSPACE")
+            dpg.configure_item(self.workspace_badge, color=(59, 130, 246, 255) if build_active else (34, 197, 94, 255))
+        if self.mode_hint and dpg.does_item_exist(self.mode_hint):
+            dpg.set_value(self.mode_hint, "Author geometry, constraints, and forces." if build_active else "Run the mechanism, inspect motion, and stress it.")
+        if self.viewport_subtitle and dpg.does_item_exist(self.viewport_subtitle):
+            dpg.set_value(self.viewport_subtitle, "Parametric layout / world coordinates" if build_active else "Simulation playback / live system state")
+        if self.footer_workspace and dpg.does_item_exist(self.footer_workspace):
+            dpg.set_value(self.footer_workspace, "BUILD" if build_active else "SIM")
+            dpg.configure_item(self.footer_workspace, color=(59, 130, 246, 255) if build_active else (34, 197, 94, 255))
+        if self.footer_tool and dpg.does_item_exist(self.footer_tool):
+            dpg.set_value(self.footer_tool, self._tool_key().replace("_", " ").upper())
+        if self.footer_hint and dpg.does_item_exist(self.footer_hint):
+            if self.pending_add:
+                armed = str(self.pending_add).replace("preset:", "Preset: ").replace("_", " ").title()
+                dpg.set_value(self.footer_hint, f"Armed: {armed}. Place once, then it clears.")
+            else:
+                dpg.set_value(self.footer_hint, f"Shift+A adds parts. Right-click canvas for actions. {self._tool_hint()}")
+
     # ----- Settings callbacks -----
     def on_snap_change(self, value):
         try:
@@ -189,6 +677,7 @@ class App:
                 dpg.set_value("snap_toggle", bool(self.snap))
         except Exception:
             pass
+        self._refresh_workspace_ui()
         # Enable/disable angle/magnitude controls based on master snap
         try:
             self._refresh_snap_controls()
@@ -323,7 +812,7 @@ class App:
                 p1,
                 color=(120, 255, 255, 200),
                 thickness=2,
-                parent="overlay_drawlist",
+                parent="main_canvas",
                 tag="surface_preview",
             )
         except Exception:
@@ -334,6 +823,12 @@ class App:
             dpg.delete_item("surface_preview")  
 
     def on_mode_change(self, mode: str):
+        if mode in self._build_only_modes() and self.workspace_mode != "build":
+            self.workspace_mode = "build"
+            self.physics.is_running = False
+        elif mode in self._sim_preferred_modes() and self.workspace_mode != "sim":
+            self.workspace_mode = "sim"
+            self.physics.is_running = True
         self.mode = mode
         if mode != "surface":
             self.surface_start_local = None
@@ -346,10 +841,21 @@ class App:
             self.is_vector_drawing = False
             self.preview_vector = None
             self._lf_body_target_id = None
+        if mode != "spring":
+            self.spring_start_body = None
+            self.spring_anchor = None
+            if getattr(self, "spring_preview_tag", None) is not None:
+                try:
+                    if dpg.does_item_exist(self.spring_preview_tag):
+                        dpg.delete_item(self.spring_preview_tag)
+                except Exception:
+                    pass
+            self.spring_preview_tag = None
         try:
             self._update_tool_panel()
         except Exception:
             pass
+        self._refresh_workspace_ui()
 
     def on_force_scope_change(self, scope: str):
         scope = (scope or 'global').lower()
@@ -379,7 +885,7 @@ class App:
         k_r = getattr(dpg, "mvKey_R", None)
 
         if key == k_space:
-            self.physics.is_running = not self.physics.is_running
+            self.toggle_simulation()
             return
         if key == k_plus:
             self.zoom_target = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom_target * (1.0 + ZOOM_FACTOR)))
@@ -430,6 +936,13 @@ class App:
     def on_hotkey_delete(self, sender, app_data):
         self.delete_selected()
 
+    def on_hotkey_a(self, sender, app_data):
+        if self._shift_down():
+            if dpg.does_item_exist("add_menu_win") and dpg.is_item_shown("add_menu_win"):
+                self.hide_add_menu()
+            else:
+                self.show_add_menu()
+
     # no radio sync needed; value drives mode
 
     # ---------- Mouse handlers ----------
@@ -437,6 +950,23 @@ class App:
         # Ensure clicks are on the canvas for canvas interactions
         if not dpg.is_item_hovered("main_canvas"):
             return
+        left_button = getattr(dpg, "mvMouseButton_Left", 0)
+        right_button = getattr(dpg, "mvMouseButton_Right", 1)
+        button = app_data if app_data is not None else left_button
+        if button == right_button:
+            self.hide_add_menu()
+            local_x, local_y = self._local_mouse()
+            wx, wy = self.R.to_world(local_x, local_y)
+            if self.snap:
+                wx, wy = self._snap_world(wx, wy)
+            self.context_menu_world = (float(wx), float(wy))
+            if not self._select_at_world(wx, wy):
+                self.clear_selection()
+            self.show_context_menu()
+            self.dragging = False
+            return
+        self.hide_context_menu()
+        self.hide_add_menu()
         local_x, local_y = self._local_mouse()
         # Ctrl+Drag panning (replaces right-click pan)
         try:
@@ -453,11 +983,28 @@ class App:
         wx, wy = wx_unsnap, wy_unsnap
         if self.snap:
             wx, wy = self._snap_world(wx, wy)
+        if isinstance(self.pending_add, str) and self.pending_add.startswith("preset:"):
+            self._apply_preset_at(self.pending_add.split(":", 1)[1], (wx, wy))
+            self._finish_pending_add()
+            self.dragging = False
+            return
         self.dragging = True
         self.drag_start_raw = (wx, wy)
         self.drag_curr_raw = (wx, wy)
         self.drag_start = (wx, wy)
         self.drag_curr = (wx, wy)
+
+        if self.mode == "spring":
+            import pymunk
+            p = pymunk.Vec2d(wx, wy)
+            body = self.physics.pick_body(p)
+            if body is not None:
+                self.spring_start_body = body
+                self.spring_anchor = None
+            else:
+                self.spring_start_body = None
+                self.spring_anchor = (wx, wy)
+            return
 
         # Shift acts as a temporary Select tool
         try:
@@ -475,35 +1022,7 @@ class App:
             self._update_surface_preview()
 
         if self.mode == "select" or shift_down:
-            import pymunk
-            p = pymunk.Vec2d(*self.drag_start)
-            body = self.physics.pick_body(p)
-            if body is not None:
-                shape = None
-                for sh in self.physics.dynamic:
-                    if sh.body is body:
-                        shape = sh
-                        break
-                if shape is not None:
-                    if hasattr(shape, 'radius'):
-                        self.selected_type, self.selected_ref = 'circle', shape
-                    elif isinstance(shape, pymunk.Poly):
-                        self.selected_type, self.selected_ref = 'box', shape
-                    else:
-                        self.selected_type, self.selected_ref = 'body', shape
-                    self._update_properties_panel()
-                    self.dragging = False
-                    return
-            seg = self.physics.pick_surface(p)
-            if seg is not None:
-                self.selected_type, self.selected_ref = 'surface', seg
-                self._update_properties_panel()
-                self.dragging = False
-                return
-            V = self.physics.pick_vector(p)
-            if V is not None:
-                self.selected_type, self.selected_ref = 'vector', V
-                self._update_properties_panel()
+            if self._select_at_world(*self.drag_start):
                 self.dragging = False
                 return
 
@@ -553,6 +1072,41 @@ class App:
                 self._fling_apply_point = None
 
     def on_mouse_drag(self, sender, app_data):
+        # Spring tool: live preview while dragging
+        if self.mode == "spring" and self.dragging:
+            local_x, local_y = self._local_mouse()
+            wx_unsnap, wy_unsnap = self.R.to_world(local_x, local_y)
+            wx, wy = wx_unsnap, wy_unsnap
+            if self.snap:
+                wx, wy = self._snap_world(wx, wy)
+            # Clear previous preview line if any
+            if self.spring_preview_tag is not None:
+                try:
+                    if dpg.does_item_exist(self.spring_preview_tag):
+                        dpg.delete_item(self.spring_preview_tag)
+                except Exception:
+                    pass
+            # Determine first endpoint (body or anchor)
+            if self.spring_start_body is not None:
+                p0 = (self.spring_start_body.position.x, self.spring_start_body.position.y)
+            else:
+                p0 = self.spring_anchor
+            p1 = (wx, wy)
+            if p0 is not None and p1 is not None:
+                s0 = self.R.to_screen(*p0)
+                s1 = self.R.to_screen(*p1)
+                self.spring_preview_tag = dpg.draw_line(
+                    s0,
+                    s1,
+                    color=(200, 200, 120, 200),
+                    thickness=2,
+                    parent=self.R.tag,
+                )
+            self.drag_curr_raw = (wx, wy)
+            self.drag_curr = (wx, wy)
+            return
+
+        # Default drag handling
         local_x, local_y = self._local_mouse()
         wx_unsnap, wy_unsnap = self.R.to_world(local_x, local_y)
         if self.mode == "surface":
@@ -578,8 +1132,43 @@ class App:
             except Exception:
                 sx, sy = 0.0, 0.0
             self.preview_vector = Vector("GHOST", sx, sy, wx, wy)
+        
+        if self.mode == "spring" and self.dragging:
+            if self.spring_preview_tag and dpg.does_item_exist(self.spring_preview_tag):
+                dpg.delete_item(self.spring_preview_tag)
+
+            # world coords
+            wx, wy = self.R.to_world(*self._local_mouse())
+
+            # origin
+            if self.spring_start_body:
+                p0 = (self.spring_start_body.position.x, self.spring_start_body.position.y)
+            else:
+                p0 = self.spring_anchor
+
+            # convert
+            s0 = self.R.to_screen(*p0)
+            s1 = self.R.to_screen(wx, wy)
+
+            # draw preview
+            self.spring_preview_tag = dpg.draw_line(
+                s0, s1,
+                color=(255,255,150,180),
+                thickness=2,
+                parent=self.R.tag
+            )
+            return
+
 
     def on_mouse_move(self, sender, app_data):
+        if self.context_menu_visible and not dpg.is_item_hovered("canvas_context_menu"):
+            left_down = getattr(dpg, "mvMouseButton_Left", None)
+            right_down = getattr(dpg, "mvMouseButton_Right", None)
+            try:
+                if (left_down is not None and dpg.is_mouse_button_down(left_down)) or (right_down is not None and dpg.is_mouse_button_down(right_down)):
+                    self.hide_context_menu()
+            except Exception:
+                pass
         local_x, local_y = self._local_mouse()
         if self.mode == "surface" and self.dragging:
             self.surface_curr_local = (local_x, local_y)
@@ -606,6 +1195,93 @@ class App:
         if self.snap:
             wx, wy = self._snap_world(wx, wy)
         self.drag_curr_raw = (wx, wy)
+
+        if self.mode == "spring":
+            import pymunk
+            p = pymunk.Vec2d(wx, wy)
+            body2 = self.physics.pick_body(p)
+
+            # Clear preview line if present
+            if self.spring_preview_tag is not None:
+                try:
+                    if dpg.does_item_exist(self.spring_preview_tag):
+                        dpg.delete_item(self.spring_preview_tag)
+                except Exception:
+                    pass
+            self.spring_preview_tag = None
+
+            a_id = None
+            b_id = None
+            anchor_a = None
+            anchor_b = None
+
+            if self.spring_start_body is not None and body2 is not None and body2 is not self.spring_start_body:
+                a_id = id(self.spring_start_body)
+                b_id = id(body2)
+            elif self.spring_start_body is not None and body2 is None:
+                a_id = id(self.spring_start_body)
+                anchor_b = (wx, wy)
+            elif self.spring_start_body is None and body2 is not None:
+                b_id = id(body2)
+                anchor_a = self.spring_anchor
+            else:
+                anchor_a = self.spring_anchor
+                anchor_b = (wx, wy)
+
+            # Determine world-space endpoints for rest length
+            p0 = None
+            p1 = None
+            if a_id is not None:
+                try:
+                    for sh in list(self.physics.dynamic) + list(self.physics.static):
+                        if id(sh.body) == a_id:
+                            p0 = (sh.body.position.x, sh.body.position.y)
+                            break
+                except Exception:
+                    pass
+            if b_id is not None:
+                try:
+                    for sh in list(self.physics.dynamic) + list(self.physics.static):
+                        if id(sh.body) == b_id:
+                            p1 = (sh.body.position.x, sh.body.position.y)
+                            break
+                except Exception:
+                    pass
+            if anchor_a is not None:
+                p0 = anchor_a
+            if anchor_b is not None:
+                p1 = anchor_b
+
+            if p0 is not None and p1 is not None:
+                dx = p1[0] - p0[0]
+                dy = p1[1] - p0[1]
+                rest = (dx * dx + dy * dy) ** 0.5
+                if rest <= 1e-6:
+                    rest = 1.0
+                spring = Spring(
+                    label=f"S{len(getattr(self.physics, 'springs', [])) + 1}",
+                    a_id=a_id,
+                    b_id=b_id,
+                    anchor_a=anchor_a,
+                    anchor_b=anchor_b,
+                    rest_length=rest,
+                    stiffness=self.spring_default_k,
+                    damping=self.spring_default_damping,
+                    max_extension_factor=self.spring_max_extension_factor,
+                )
+                # Ensure the springs list exists
+                if not hasattr(self.physics, "springs"):
+                    self.physics.springs = []
+                self._push_undo()
+                self.physics.springs.append(spring)
+                self.hier_dirty = True
+
+            self.spring_start_body = None
+            self.spring_anchor = None
+            self.dragging = False
+            if self.pending_add == "spring":
+                self._finish_pending_add()
+            return
 
         if self.mode == "surface":
             start_local = self.surface_start_local
@@ -645,6 +1321,8 @@ class App:
                 self.hier_dirty = True
             self.surface_start_local = None
             self.surface_curr_local = None
+            if self.pending_add == "surface":
+                self._finish_pending_add()
             return
 
         if self.mode == "body":
@@ -668,6 +1346,8 @@ class App:
                     except Exception:
                         pass
                 self.hier_dirty = True
+                if self.pending_add in {"body_box", "body_circle"}:
+                    self._finish_pending_add()
 
         elif self.mode == "force" and self.is_vector_drawing:
             # Finalize global or local force drawing
@@ -690,7 +1370,6 @@ class App:
                 else:
                     # Local force: attach to selected body id
                     try:
-                        from physics import LocalForce
                         ang = math.degrees(math.atan2(dy, dx))
                         mag = math.hypot(dx, dy)
                         bid = self._lf_body_target_id
@@ -705,6 +1384,8 @@ class App:
             self.preview_vector = None
             self.is_vector_drawing = False
             self._lf_body_target_id = None
+            if self.pending_add == "force":
+                self._finish_pending_add()
             try:
                 self._update_tool_panel()
             except Exception:
@@ -734,6 +1415,8 @@ class App:
                         self._last_fling_time = now
             self._fling_selected_body = None
             self._fling_apply_point = None
+            if self.pending_add == "fling":
+                self._finish_pending_add()
 
         self._update_properties_panel()
 
@@ -756,29 +1439,35 @@ class App:
             vw = dpg.get_viewport_client_width()
             vh = dpg.get_viewport_client_height()
             margin = 10
-            left_w = max(300, int(vw * 0.26))
-            if dpg.does_item_exist("controls_win"):
-                dpg.configure_item("controls_win", pos=(margin, margin), width=left_w, height=vh - margin * 2)
-            vx = margin + left_w + margin
-            vw_w = max(300, vw - vx - margin)
-            vw_h = vh - margin * 2
+            header_h = 38
+            ribbon_h = 88
+            bottom_h = 68
+            left_w = max(250, int(vw * 0.19))
+            right_w = max(300, int(vw * 0.23))
+            body_y = margin + header_h + margin + ribbon_h + margin
+            body_h = max(300, vh - body_y - bottom_h - margin * 2)
+            center_x = margin + left_w + margin
+            center_w = max(420, vw - left_w - right_w - margin * 4)
+
+            if dpg.does_item_exist("topbar_win"):
+                dpg.configure_item("topbar_win", pos=(margin, margin), width=vw - margin * 2, height=header_h)
+            if dpg.does_item_exist("ribbon_win"):
+                dpg.configure_item("ribbon_win", pos=(margin, margin + header_h + margin), width=vw - margin * 2, height=ribbon_h)
+            if dpg.does_item_exist("browser_win"):
+                dpg.configure_item("browser_win", pos=(margin, body_y), width=left_w, height=body_h)
             if dpg.does_item_exist("viewport_win"):
-                dpg.configure_item("viewport_win", pos=(vx, margin), width=vw_w, height=vw_h)
-            right_w = 260
-            # If a bottom world panel exists, reserve its height; otherwise, use full height
-            bottom_h = 0
-            if dpg.does_item_exist("world_panel"):
-                # legacy support if present
-                bottom_h = 140
+                dpg.configure_item("viewport_win", pos=(center_x, body_y), width=center_w, height=body_h)
+            if dpg.does_item_exist("inspector_win"):
+                dpg.configure_item("inspector_win", pos=(center_x + center_w + margin, body_y), width=right_w, height=body_h)
+            if dpg.does_item_exist("statusbar_win"):
+                dpg.configure_item("statusbar_win", pos=(margin, vh - bottom_h - margin), width=vw - margin * 2, height=bottom_h)
             if dpg.does_item_exist("hier_panel"):
-                dpg.configure_item("hier_panel", width=right_w, height=max(50, vw_h - 20))
-            left_area_w = max(200, vw_w - right_w - 20)
+                dpg.configure_item("hier_panel", width=left_w - 24, height=max(180, int(body_h * 0.55)))
+
+            canvas_w = max(320, center_w - 24)
+            canvas_h = max(260, body_h - 42)
             if dpg.does_item_exist("main_canvas"):
-                # Fill available height minus small padding
-                canvas_h = max(200, vw_h - bottom_h - 20)
-                dpg.configure_item("main_canvas", width=left_area_w, height=canvas_h)
-            if dpg.does_item_exist("overlay_drawlist"):
-                dpg.configure_item("overlay_drawlist", width=left_area_w, height=canvas_h)
+                dpg.configure_item("main_canvas", width=canvas_w, height=canvas_h)
         except Exception:
             pass
 
@@ -797,7 +1486,8 @@ class App:
             pass
 
         R.clear()
-        R.draw_grid(spacing=1.0)
+        if self.grid_visible:
+            R.draw_grid(spacing=max(0.1, float(self.snap_step)))
         try:
             R.draw_bounds(self.physics.bounds_limit)
         except Exception:
@@ -850,7 +1540,17 @@ class App:
             if self.body_tool_type == "circle":
                 R.ghost_circle((cx, cy), float(self.body_circle_r))
             else:
-                R.ghost_box((cx, cy), float(self.body_box_w), float(self.body_box_h))
+                # Box preview using ghost lines (no ghost_box in Renderer)
+                half_w = float(self.body_box_w) * 0.5
+                half_h = float(self.body_box_h) * 0.5
+                p0 = (cx - half_w, cy - half_h)
+                p1 = (cx + half_w, cy - half_h)
+                p2 = (cx + half_w, cy + half_h)
+                p3 = (cx - half_w, cy + half_h)
+                R.ghost_line(p0, p1)
+                R.ghost_line(p1, p2)
+                R.ghost_line(p2, p3)
+                R.ghost_line(p3, p0)
 
         for s in self.physics.static:
             R.draw_shape(s)
@@ -862,6 +1562,11 @@ class App:
             R.draw_shape(s)
             try:
                 R.draw_shape_label(s)
+            except Exception:
+                pass
+        for sp in getattr(self.physics, "springs", []):
+            try:
+                R.draw_spring(sp, self.physics)
             except Exception:
                 pass
         # Watermark / credit in lower-right of canvas
@@ -908,7 +1613,11 @@ class App:
                     dpg.set_value("prop_angle_ro", f"{ang_deg:.2f}")
         except Exception:
             pass
+        
+        # Draw velocity arrows for all dynamic bodies
+        for s in self.physics.dynamic:
             R.draw_velocity(s)
+        
         for V in self.physics.vectors:
             R.draw_vector(V)
 
@@ -1303,6 +2012,30 @@ class App:
                 'label': V.label,
                 'x1': float(V.x1), 'y1': float(V.y1), 'x2': float(V.x2), 'y2': float(V.y2)
             })
+        # Serialize springs
+        state['springs'] = []
+        for sp in getattr(self.physics, 'springs', []):
+            state['springs'].append({
+                'label': sp.label,
+                'a_id': sp.a_id,
+                'b_id': sp.b_id,
+                'anchor_a': sp.anchor_a,
+                'anchor_b': sp.anchor_b,
+                'rest_length': float(sp.rest_length),
+                'stiffness': float(sp.stiffness),
+                'damping': float(sp.damping),
+                'max_extension_factor': float(sp.max_extension_factor),
+            })
+        # Serialize local forces
+        state['local_forces'] = []
+        for lf in getattr(self.physics, 'local_forces', []):
+            state['local_forces'].append({
+                'label': lf.label,
+                'body_id': lf.body_id,
+                'magnitude': float(lf.magnitude),
+                'angle_deg': float(lf.angle_deg),
+                'mode': lf.mode,
+            })
         return state
 
     def _restore_state(self, state):
@@ -1319,6 +2052,8 @@ class App:
             pass
         self.physics.static = []
         self.physics.vectors = []
+        self.physics.springs = []
+        self.physics.local_forces = []
 
         for d in state.get('dynamic', []):
             if d.get('type') == 'circle':
@@ -1342,11 +2077,39 @@ class App:
             except Exception:
                 pass
         self.physics.vectors = [Vector(v['label'], v['x1'], v['y1'], v['x2'], v['y2']) for v in state.get('vectors', [])]
+        
+        # Restore springs
+        for sp_data in state.get('springs', []):
+            sp = Spring(
+                label=sp_data['label'],
+                a_id=sp_data.get('a_id'),
+                b_id=sp_data.get('b_id'),
+                anchor_a=sp_data.get('anchor_a'),
+                anchor_b=sp_data.get('anchor_b'),
+                rest_length=sp_data.get('rest_length', 1.0),
+                stiffness=sp_data.get('stiffness', 25.0),
+                damping=sp_data.get('damping', 0.5),
+                max_extension_factor=sp_data.get('max_extension_factor', 2.0),
+            )
+            self.physics.springs.append(sp)
+        
+        # Restore local forces
+        for lf_data in state.get('local_forces', []):
+            lf = LocalForce(
+                label=lf_data['label'],
+                body_id=lf_data['body_id'],
+                magnitude=lf_data['magnitude'],
+                angle_deg=lf_data['angle_deg'],
+                mode=lf_data['mode'],
+            )
+            self.physics.local_forces.append(lf)
+        
         self.vector_counter = max(self.vector_counter, state.get('counters', {}).get('vector_counter', self.vector_counter))
         self.physics.is_running = bool(state.get('running', True))
         self.selected_ref = None
         self.selected_type = None
         self.hier_dirty = True
+        self._update_properties_panel()
 
     def _push_undo(self):
         try:
@@ -1406,8 +2169,12 @@ class App:
         self.hier_dirty = True
 
     def restart_sim(self):
+        self.restore_startup_scene()
+
+    def restore_startup_scene(self):
         try:
             self._restore_state(self._startup_snapshot)
+            self.set_workspace_mode("build")
         except Exception:
             pass
 
@@ -1562,6 +2329,7 @@ class App:
             self.angle_snap_deg = float(data.get("angle_snap_deg", self.angle_snap_deg))
             self.mag_snap_enabled = bool(data.get("mag_snap_enabled", self.mag_snap_enabled))
             self.mag_snap_step = float(data.get("mag_snap_step", self.mag_snap_step))
+            self.show_welcome_on_startup = bool(data.get("show_welcome_on_startup", self.show_welcome_on_startup))
             # Clamp bounds
             if self.snap_step <= 0.0:
                 self.snap_step = 0.0
@@ -1573,6 +2341,7 @@ class App:
             pass
 
     def _save_settings(self):
+        """Save settings to file using atomic write to prevent corruption."""
         try:
             data = {
                 "snap_step": float(self.snap_step),
@@ -1597,11 +2366,28 @@ class App:
                 "angle_snap_deg": float(self.angle_snap_deg),
                 "mag_snap_enabled": bool(self.mag_snap_enabled),
                 "mag_snap_step": float(self.mag_snap_step),
+                "show_welcome_on_startup": bool(self.show_welcome_on_startup),
             }
-            with open(self._settings_path(), "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
+            # Atomic write: write to temp file then rename
+            import tempfile
+            settings_path = self._settings_path()
+            fd, temp_path = tempfile.mkstemp(suffix='.json', dir=os.path.dirname(settings_path))
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+                # Atomic rename (works on most filesystems)
+                os.replace(temp_path, settings_path)
+            except Exception as e:
+                # Clean up temp file on error
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+                from .logger import log_error
+                log_error("Failed to save settings", e)
+        except Exception as e:
+            from .logger import log_error
+            log_error("Failed to save settings", e)
 
     # ---------- Main loop ----------
     def run(self):
@@ -1624,6 +2410,8 @@ class App:
                 )
                 if dpg.does_item_exist(self.stats):
                     dpg.set_value(self.stats, text)
+                if dpg.does_item_exist("time_scale_value"):
+                    dpg.set_value("time_scale_value", f"{self.physics.time_scale:.1f}x")
                 # Update run status indicator
                 status_txt = f"Status: {'Running' if self.physics.is_running else 'Paused'}"
                 if hasattr(self, 'run_status') and dpg.does_item_exist(self.run_status):
@@ -1633,6 +2421,7 @@ class App:
                         dpg.configure_item(self.run_status, color=(34,197,94,255) if self.physics.is_running else (239,68,68,255))
                     except Exception:
                         pass
+                self._refresh_workspace_ui()
             except Exception as e:
                 print("[WARN] Stats update failed:", e)
             dpg.render_dearpygui_frame()

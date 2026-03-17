@@ -1,0 +1,12 @@
+# Development dependencies for Fizix Mech
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+
+# Linting
+ruff>=0.1.0
+mypy>=1.5.0
+
+# Type stubs
+types-Pillow>=10.0.0
