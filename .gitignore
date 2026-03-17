@@ -30,4 +30,5 @@ Thumbs.db
 # Build artifacts
 build/
 dist/
+*.spec
 *.egg-info/

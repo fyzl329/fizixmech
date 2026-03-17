@@ -8,7 +8,7 @@ All magic numbers and configurable values are centralized here.
 # APPLICATION
 # ─────────────────────────────────────────────────────────────────────────────
 APP_NAME: str = "Fizix Mech"
-APP_VERSION: str = "1.0.0"
+APP_VERSION: str = "1.0.2"
 APP_TITLE: str = "FZXMCH - Professional Physics Sandbox"
 
 # ─────────────────────────────────────────────────────────────────────────────

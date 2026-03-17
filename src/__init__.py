@@ -5,7 +5,7 @@ FZXMCH - A professional physics sandbox built with Dear PyGui and Pymunk.
 Professional CAD-style interface with beginner-friendly accessibility.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.2"
 __author__ = "Fayazul"
 
 # Core modules

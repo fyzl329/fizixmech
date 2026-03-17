@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fizixmech"
-version = "1.0.0"
+version = "1.0.2"
 description = "2D physics sandbox built with Dear PyGui and Pymunk"
 readme = "README.md"
 license = {text = "MIT"}
